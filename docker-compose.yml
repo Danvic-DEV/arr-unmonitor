@@ -16,6 +16,12 @@ services:
       CHANGE_LOG_PATH: "/config/change-log.jsonl"
       LOG_PATH: "/config/app-log.jsonl"
       PORT: "5200"
+      # Rotate the JSONL logs at 32 MB (defaults; uncomment to change).
+      # LOG_MAX_BYTES: "33554432"
+      # CHANGE_LOG_MAX_BYTES: "33554432"
     volumes:
       - ./config:/config
+    # An idle worker settles at ~45-70 MB RSS and does not grow with log size.
+    # 512 MB leaves generous headroom for scanning a large library.
+    mem_limit: 512m
     restart: unless-stopped

@@ -13,7 +13,19 @@ These are read at startup and provide default values. UI-saved settings override
 | `SETTINGS_PATH` | No | `/config/settings.json` | File path for persisted settings |
 | `CHANGE_LOG_PATH` | No | `/config/change-log.jsonl` | File path for the change log |
 | `LOG_PATH` | No | `/config/app-log.jsonl` | File path for the persistent application log |
+| `LOG_MAX_BYTES` | No | `33554432` (32 MB) | Rotate `app-log.jsonl` once it exceeds this size. One backup (`app-log.jsonl.1`) is kept, so worst-case disk use is roughly double. |
+| `CHANGE_LOG_MAX_BYTES` | No | `33554432` (32 MB) | Rotate `change-log.jsonl` once it exceeds this size. Two backups are kept. |
 | `PORT` | No | `5200` | HTTP listen port |
+
+### Log rotation and memory
+
+Both JSONL files are append-only and would otherwise grow without limit. They are now rotated at
+the sizes above, and the app only ever reads a bounded tail of them, so **memory usage does not
+scale with log size**. An idle worker settles at roughly 45–70 MB RSS regardless of how large the
+logs on disk have become.
+
+Setting either variable to a very large value disables rotation in practice; the app stays
+memory-bounded either way, but the files will keep consuming disk.
 
 ## Settings File (`settings.json`)
 

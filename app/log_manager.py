@@ -8,48 +8,58 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from .jsonl import env_bytes, remove_backups, rotate_if_needed, tail_entries
+
 
 LEVEL_NAMES = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _LEVEL_MAP = {name: getattr(logging, name) for name in LEVEL_NAMES}
+
+DEFAULT_LOG_MAX_BYTES = 32 * 1024 * 1024
+DEFAULT_LOG_BACKUP_COUNT = 1
 
 
 class LogStore:
     """Thread-safe in-memory ring buffer + optional JSONL file persistence."""
 
-    def __init__(self, path: str | None = None, maxlen: int = 5000) -> None:
+    def __init__(
+        self,
+        path: str | None = None,
+        maxlen: int = 5000,
+        max_bytes: int | None = None,
+        backup_count: int | None = None,
+    ) -> None:
         self._buffer: deque[dict[str, Any]] = deque(maxlen=maxlen)
         self._lock = threading.Lock()
         self._file_path: Path | None = None
+        self._max_bytes = (
+            env_bytes("LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES) if max_bytes is None else max_bytes
+        )
+        self._backup_count = (
+            DEFAULT_LOG_BACKUP_COUNT if backup_count is None else backup_count
+        )
         if path:
             self._file_path = Path(path)
             self._file_path.parent.mkdir(parents=True, exist_ok=True)
+            rotate_if_needed(self._file_path, self._max_bytes, self._backup_count)
             self._load_from_file(maxlen)
 
     def _load_from_file(self, maxlen: int) -> None:
-        """Seed the ring buffer from the last N lines of the log file."""
+        """Seed the ring buffer from the last N lines of the log file.
+
+        Only the tail of the file is read. Reading it whole made startup RSS scale with
+        the on-disk log size and never gave the memory back.
+        """
         if not self._file_path or not self._file_path.exists():
             return
-        try:
-            with self._file_path.open("r", encoding="utf-8") as fh:
-                lines = fh.readlines()
-            for line in lines[-maxlen:]:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    if isinstance(entry, dict):
-                        self._buffer.append(entry)
-                except json.JSONDecodeError:
-                    continue
-        except OSError:
-            pass
+        for entry in tail_entries(self._file_path, maxlen):
+            self._buffer.append(entry)
 
     def append(self, entry: dict[str, Any]) -> None:
         with self._lock:
             self._buffer.append(entry)
             if self._file_path:
                 try:
+                    rotate_if_needed(self._file_path, self._max_bytes, self._backup_count)
                     with self._file_path.open("a", encoding="utf-8") as fh:
                         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 except OSError:
@@ -80,6 +90,7 @@ class LogStore:
                         pass
                 except OSError:
                     pass
+                remove_backups(self._file_path, self._backup_count)
 
 
 class BufferHandler(logging.Handler):
