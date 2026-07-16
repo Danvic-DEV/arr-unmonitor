@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - development
+  pull_request:
 
 permissions:
   contents: read
@@ -29,6 +30,8 @@ jobs:
 
   docker:
     needs: test
+    # Only publish images on a real push to development; PRs just run the tests.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
