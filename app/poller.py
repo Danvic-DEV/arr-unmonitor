@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 
 from .arr_client import ArrClientError, BaseArrClient, RadarrClient, SonarrClient
 from .change_log import ChangeLogStore
@@ -13,6 +15,40 @@ from .config import AppSettings, ServerConfig, SettingsStore
 logger = logging.getLogger(__name__)
 
 MIN_POLL_INTERVAL = 30
+# Full Sonarr rescans catch changes the series summary can't reveal (manual re-monitor, profile edits).
+SONARR_FULL_SCAN_SECONDS = int(os.getenv("SONARR_FULL_SCAN_SECONDS", "21600"))
+
+
+def _series_fingerprint(item: dict[str, Any], server: ServerConfig) -> tuple[object, ...] | None:
+    """Summarise the series fields that change whenever its episodes or files change."""
+    stats = item.get("statistics")
+    if not isinstance(stats, dict):
+        return None
+    seasons: list[tuple[object, ...]] = []
+    for season in item.get("seasons") or []:
+        if not isinstance(season, dict):
+            continue
+        s_stats = season.get("statistics") or {}
+        seasons.append((
+            season.get("seasonNumber"),
+            season.get("monitored"),
+            s_stats.get("episodeFileCount"),
+            s_stats.get("episodeCount"),
+            s_stats.get("totalEpisodeCount"),
+            s_stats.get("sizeOnDisk"),
+        ))
+    return (
+        item.get("monitored"),
+        item.get("status"),
+        item.get("qualityProfileId"),
+        stats.get("episodeFileCount"),
+        stats.get("episodeCount"),
+        stats.get("totalEpisodeCount"),
+        stats.get("sizeOnDisk"),
+        tuple(seasons),
+        server.unmonitor_season,
+        server.unmonitor_series,
+    )
 
 
 @dataclass
@@ -59,6 +95,9 @@ class ServerRunner:
         self._run_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # series id -> fingerprint of a series last scanned with nothing to do.
+        self._series_fingerprints: dict[int, tuple[object, ...]] = {}
+        self._last_full_scan: float = 0.0
 
     # ── Lifecycle ──
 
@@ -294,9 +333,12 @@ class ServerRunner:
         count = 0
         episodes_checked = 0
         series_list = sonarr_client.get_items()
+        now = time.time()
+        full_scan = now - self._last_full_scan >= SONARR_FULL_SCAN_SECONDS
+        skipped = 0
         logger.info(
-            "Evaluating %d series",
-            len(series_list),
+            "Evaluating %d series (%s scan)",
+            len(series_list), "full" if full_scan else "incremental",
             extra={"source_label": sonarr_client.label},
         )
         for item in series_list:
@@ -304,33 +346,36 @@ class ServerRunner:
             if not isinstance(series_id, int):
                 continue
 
+            fingerprint = _series_fingerprint(item, server)
+            if (
+                not full_scan
+                and fingerprint is not None
+                and self._series_fingerprints.get(series_id) == fingerprint
+            ):
+                skipped += 1
+                continue
+            count_before = count
+            acted = False
+
             series_title = item.get("title", f"Series {series_id}")
             series_year = item.get("year", "")
             series_slug = item.get("titleSlug", "")
             series_url = f"{sonarr_client.base_url}/series/{series_slug}" if series_slug else ""
 
-            episodes = sonarr_client.get_episodes(series_id)
-            episode_files = sonarr_client.get_episode_files(series_id)
+            episodes = sonarr_client.get_episodes(series_id, include_episode_files=True)
             monitored_eps = sum(1 for ep in episodes if ep.get("monitored"))
+            files_count = sum(1 for ep in episodes if isinstance(ep.get("episodeFile"), dict))
             logger.debug(
                 "Scanning '%s' (%s) — %d episodes (%d monitored), %d files",
-                series_title, series_year, len(episodes), monitored_eps, len(episode_files),
+                series_title, series_year, len(episodes), monitored_eps, files_count,
                 extra={"source_label": sonarr_client.label, "link_url": series_url},
             )
-            episode_file_by_id: dict[int, dict[str, object]] = {}
-            for episode_file in episode_files:
-                file_id = episode_file.get("id")
-                if isinstance(file_id, int):
-                    episode_file_by_id[file_id] = episode_file
 
             for episode in episodes:
                 if not episode.get("monitored", False):
                     continue
-                episode_file_id = episode.get("episodeFileId")
-                if not isinstance(episode_file_id, int):
-                    continue
-                episode_file = episode_file_by_id.get(episode_file_id)
-                if not episode_file:
+                episode_file = episode.get("episodeFile")
+                if not isinstance(episode_file, dict):
                     continue
                 episodes_checked += 1
                 # Use Sonarr's own cutoff calculation
@@ -363,16 +408,29 @@ class ServerRunner:
 
             # ── Cascade: unmonitor seasons ──
             if server.unmonitor_season and isinstance(sonarr_client, SonarrClient):
-                self._cascade_unmonitor_seasons(
+                acted |= self._cascade_unmonitor_seasons(
                     server, sonarr_client, item, episodes, series_url,
                 )
 
             # ── Cascade: unmonitor series ──
             if server.unmonitor_series and isinstance(sonarr_client, SonarrClient):
-                self._cascade_unmonitor_series(
+                acted |= self._cascade_unmonitor_series(
                     server, sonarr_client, item, episodes, series_url,
                 )
 
+            # Only cache series we left untouched; changed ones must be re-read next poll.
+            if fingerprint is not None and count == count_before and not acted:
+                self._series_fingerprints[series_id] = fingerprint
+            else:
+                self._series_fingerprints.pop(series_id, None)
+
+        if full_scan:
+            self._last_full_scan = now
+        if skipped:
+            logger.info(
+                "Skipped %d unchanged series", skipped,
+                extra={"source_label": sonarr_client.label},
+            )
         return count, episodes_checked, ""
 
     # ── Cascade helpers ──
@@ -384,12 +442,13 @@ class ServerRunner:
         series: dict[str, object],
         episodes: list[dict[str, object]],
         series_url: str,
-    ) -> None:
+    ) -> bool:
         """Unmonitor any season where every episode is already unmonitored."""
         series_title = series.get("title", "Unknown")
         seasons = series.get("seasons")
         if not isinstance(seasons, list):
-            return
+            return False
+        acted = False
 
         # Build a map: season_number -> list of episodes
         eps_by_season: dict[int, list[dict[str, object]]] = {}
@@ -412,6 +471,7 @@ class ServerRunner:
                     extra={"source_label": sonarr_client.label, "link_url": series_url},
                 )
                 sonarr_client.unmonitor_season(series, sn)
+                acted = True
                 self.change_log_store.append({
                     "service": server.name,
                     "series_title": str(series_title),
@@ -421,6 +481,7 @@ class ServerRunner:
                     "action": "Unmonitored season",
                     "link_url": series_url,
                 })
+        return acted
 
     def _cascade_unmonitor_series(
         self,
@@ -429,16 +490,16 @@ class ServerRunner:
         series: dict[str, object],
         episodes: list[dict[str, object]],
         series_url: str,
-    ) -> None:
+    ) -> bool:
         """Unmonitor a series if ended and every episode is unmonitored."""
         if not series.get("monitored", False):
-            return
+            return False
         if str(series.get("status", "")).lower() != "ended":
-            return
+            return False
         if not episodes:
-            return
+            return False
         if any(ep.get("monitored", False) for ep in episodes):
-            return
+            return False
 
         series_title = series.get("title", "Unknown")
         logger.info(
@@ -456,6 +517,7 @@ class ServerRunner:
             "action": "Unmonitored series",
             "link_url": series_url,
         })
+        return True
 
     # ── Re-monitor: single cycle ──
 
@@ -616,14 +678,7 @@ class ServerRunner:
             series_slug = item.get("titleSlug", "")
             series_url = f"{sonarr_client.base_url}/series/{series_slug}" if series_slug else ""
 
-            episodes = sonarr_client.get_episodes(series_id)
-            episode_files = sonarr_client.get_episode_files(series_id)
-
-            episode_file_by_id: dict[int, dict[str, object]] = {}
-            for episode_file in episode_files:
-                file_id = episode_file.get("id")
-                if isinstance(file_id, int):
-                    episode_file_by_id[file_id] = episode_file
+            episodes = sonarr_client.get_episodes(series_id, include_episode_files=True)
 
             ignore_specials = server.remonitor_ignore_specials
 
@@ -633,11 +688,8 @@ class ServerRunner:
                     continue
                 if ignore_specials and episode.get("seasonNumber") == 0:
                     continue
-                episode_file_id = episode.get("episodeFileId")
-                if not isinstance(episode_file_id, int):
-                    continue
-                episode_file = episode_file_by_id.get(episode_file_id)
-                if not episode_file:
+                episode_file = episode.get("episodeFile")
+                if not isinstance(episode_file, dict):
                     continue
                 episodes_checked += 1
 

@@ -429,8 +429,7 @@ def create_app() -> Flask:
                         health_state = "error"
 
         today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        unmonitored_today = change_log_store.count_since(today_start)
-        unmonitored_today_by_server = change_log_store.count_since_by_server(today_start)
+        unmonitored_today, unmonitored_today_by_server = change_log_store.counts_since(today_start)
 
         payload["servers"] = []
         for s in settings.servers:
