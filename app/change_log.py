@@ -32,6 +32,9 @@ class ChangeLogStore:
         self._backup_count = (
             DEFAULT_CHANGE_LOG_BACKUP_COUNT if backup_count is None else backup_count
         )
+        # Cache for counts_since: (since, file_size, file_mtime, total, by_server).
+        # Invalidated automatically whenever the file's size/mtime changes.
+        self._counts_cache: tuple[float, int, float, int, dict[str, int]] | None = None
 
     def append(self, entry: dict[str, object]) -> None:
         enriched = {"timestamp": time.time(), **entry}
@@ -57,30 +60,47 @@ class ChangeLogStore:
             with self.path.open("w", encoding="utf-8"):
                 pass
             remove_backups(self.path, self._backup_count)
+            self._counts_cache = None
 
-    def count_since(self, since_timestamp: float) -> int:
+    def counts_since(self, since_timestamp: float) -> tuple[int, dict[str, int]]:
+        """Return (total, {server: count}) of changes since a timestamp in one pass.
+
+        The dashboard polls /status every few seconds; caching against the file's
+        size+mtime keeps that poll from re-scanning the whole log unless it changed.
+        """
         if not self.path.exists():
-            return 0
+            return 0, {}
 
-        count = 0
         with self._lock:
+            try:
+                stat = self.path.stat()
+                sig: tuple[int, float] | None = (stat.st_size, stat.st_mtime)
+            except OSError:
+                sig = None
+
+            cache = self._counts_cache
+            if cache is not None and sig is not None:
+                c_since, c_size, c_mtime, c_total, c_by = cache
+                if c_since == since_timestamp and (c_size, c_mtime) == sig:
+                    return c_total, dict(c_by)
+
+            total = 0
+            by_server: dict[str, int] = {}
             for payload in iter_entries(self.path):
                 timestamp = payload.get("timestamp")
                 if isinstance(timestamp, (int, float)) and float(timestamp) >= since_timestamp:
-                    count += 1
-        return count
+                    total += 1
+                    service = payload.get("service", "")
+                    if service:
+                        by_server[service] = by_server.get(service, 0) + 1
+
+            if sig is not None:
+                self._counts_cache = (since_timestamp, sig[0], sig[1], total, dict(by_server))
+            return total, dict(by_server)
+
+    def count_since(self, since_timestamp: float) -> int:
+        return self.counts_since(since_timestamp)[0]
 
     def count_since_by_server(self, since_timestamp: float) -> dict[str, int]:
         """Return {server_name: count} of changes since a timestamp."""
-        if not self.path.exists():
-            return {}
-
-        counts: dict[str, int] = {}
-        with self._lock:
-            for payload in iter_entries(self.path):
-                timestamp = payload.get("timestamp")
-                if isinstance(timestamp, (int, float)) and float(timestamp) >= since_timestamp:
-                    service = payload.get("service", "")
-                    if service:
-                        counts[service] = counts.get(service, 0) + 1
-        return counts
+        return self.counts_since(since_timestamp)[1]

@@ -136,8 +136,14 @@ class SonarrClient(BaseArrClient):
     def get_episode_files(self, series_id: int) -> list[dict[str, Any]]:
         return self._request("GET", "episodefile", params={"seriesId": series_id}).json()
 
-    def get_episodes(self, series_id: int) -> list[dict[str, Any]]:
-        return self._request("GET", "episode", params={"seriesId": series_id}).json()
+    def get_episodes(
+        self, series_id: int, include_episode_files: bool = False,
+    ) -> list[dict[str, Any]]:
+        # includeEpisodeFile embeds each episode's file, saving a second request per series.
+        params: dict[str, Any] = {"seriesId": series_id}
+        if include_episode_files:
+            params["includeEpisodeFile"] = "true"
+        return self._request("GET", "episode", params=params).json()
 
     def unmonitor_episode(self, episode: dict[str, Any], series_title: str = "", series_slug: str = "") -> None:
         updated = dict(episode)
